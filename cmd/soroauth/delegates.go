@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/soroauth/soroauth-go"
 )
@@ -14,7 +15,7 @@ import (
 const delegatesUsage = `soroauth delegates — wrap an entry in a delegated-signer credential.
 
 usage:
-  soroauth delegates --entry <base64> (--valid-until <ledger> | --valid-for <ledgers>) \
+  soroauth delegates --entry <base64|-> (--valid-until <ledger> | --valid-for <ledgers>) \
                      [--delegate <address> ...] [--nested-json <json>] \
                      [--rpc-url <url>] [--json]
 
@@ -23,6 +24,11 @@ lifetime in ledgers, added to the current ledger). --valid-for needs an RPC
 endpoint, taken from --rpc-url or, if that is unset, $SOROAUTH_RPC_URL; it is
 refused when neither names one, because guessing a network here would stamp an
 expiration bound to the wrong chain.
+
+Subcommands support reading entries from stdin using --entry - so commands compose in pipelines:
+
+  soroauth delegates --entry entry.b64 --valid-until 1234567 --delegate GABC... | \
+    soroauth sign --entry - --valid-until 1234567 --network testnet --secret-env SEED --for GABC...
 
 Converts an ADDRESS or ADDRESS_V2 entry into ADDRESS_WITH_DELEGATES (CAP-71-01),
 with the delegates sorted into the order the protocol requires. Pass --delegate
@@ -64,6 +70,13 @@ func (a *addressList) Set(value string) error {
 }
 
 func runDelegates(args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	return runDelegatesWithStdin(args, stdout, stderr, getenv, os.Stdin)
+}
+
+// runDelegatesWithStdin is runDelegates with the reader `--entry -` draws from
+// injected, so a pipeline can be driven from a test. getenv is here because
+// --valid-for falls back to $SOROAUTH_RPC_URL.
+func runDelegatesWithStdin(args []string, stdout, stderr io.Writer, getenv func(string) string, stdin io.Reader) error {
 	flags := flag.NewFlagSet("delegates", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
@@ -72,7 +85,7 @@ func runDelegates(args []string, stdout, stderr io.Writer, getenv func(string) s
 		flags.PrintDefaults()
 	}
 
-	entryFlag := flags.String("entry", "", "the authorization entry, as base64 XDR")
+	entryFlag := flags.String("entry", "", "the authorization entry, as base64 XDR or -")
 	validUntil := flags.Uint("valid-until", 0, "the last ledger at which the signatures are valid")
 	validFor := flags.Uint64("valid-for", 0, "the signature lifetime in ledgers, resolved against the current ledger (needs --rpc-url)")
 	rpcURL := flags.String("rpc-url", "", "RPC endpoint used to resolve --valid-for (default $SOROAUTH_RPC_URL)")
@@ -85,7 +98,12 @@ func runDelegates(args []string, stdout, stderr io.Writer, getenv func(string) s
 		return newErrorf(ExitUsageError, "%w", err)
 	}
 
-	entry, err := decodeEntry(*entryFlag)
+	resolvedEntry, err := resolveEntryArg(*entryFlag, stdin)
+	if err != nil {
+		return writeJSONError(stdout, *jsonFlag, err)
+	}
+
+	entry, err := decodeEntry(resolvedEntry)
 	if err != nil {
 		return writeJSONError(stdout, *jsonFlag, err)
 	}
